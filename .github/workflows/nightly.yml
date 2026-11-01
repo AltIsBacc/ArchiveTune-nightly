@@ -1,0 +1,187 @@
+name: ArchiveTune Nightly
+
+on:
+  schedule:
+    - cron: "0 18 * * *"   # daily 18:00 UTC (02:00 Manila). Edit to taste.
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if there are no new commits"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: rukamori/ArchiveTune
+  UPSTREAM_BRANCH: "dev"
+  # Space-separated Gradle tasks
+  # assemble{Gms|Foss}{Mobile|Tv}{Arm64|Armeabi|X86|X86_64|Universal}Release
+  GRADLE_TASKS: "assembleFossMobileUniversalRelease"
+  JAVA_VERSION: "27"
+  BUILD_TOOLS: "35.0.0"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Find previous built commit
+        id: prev
+        run: |
+          body=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=50" \
+            --jq '[.[] | select(.tag_name | startswith("nightly-"))][0].body // ""')
+          prev=$(printf '%s' "$body" | grep -oP 'upstream-commit:\K[0-9a-f]{40}' | head -n1 || true)
+          echo "sha=${prev}" >> "$GITHUB_OUTPUT"
+          echo "Previous built commit: ${prev:-<none>}"
+
+      - name: Clone upstream
+        id: up
+        run: |
+          branch_arg=""
+          [ -n "$UPSTREAM_BRANCH" ] && branch_arg="--branch $UPSTREAM_BRANCH"
+          git clone --recurse-submodules $branch_arg \
+            "https://github.com/${UPSTREAM_REPO}.git" upstream
+          cd upstream
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: gate
+        run: |
+          if [ "${{ steps.prev.outputs.sha }}" = "${{ steps.up.outputs.sha }}" ] \
+             && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "No new commits since ${{ steps.up.outputs.short }}, skipping."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes
+        if: steps.gate.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          PREV="${{ steps.prev.outputs.sha }}"
+          NEW="${{ steps.up.outputs.sha }}"
+          URL="https://github.com/${UPSTREAM_REPO}"
+
+          if [ -n "$PREV" ] && git cat-file -e "$PREV^{commit}" 2>/dev/null; then
+            RANGE="${PREV}..${NEW}"
+            PREV_LABEL="[\`${PREV:0:7}\`](${URL}/commit/${PREV})"
+          else
+            RANGE="-n 20 ${NEW}"
+            PREV_LABEL="_none (first build or history rewritten, showing last 20 commits)_"
+          fi
+
+          {
+            echo "## ArchiveTune Nightly"
+            echo
+            echo "| | Commit |"
+            echo "|---|---|"
+            echo "| **Previous** | ${PREV_LABEL} |"
+            echo "| **Latest** | [\`${NEW:0:7}\`](${URL}/commit/${NEW}) |"
+            echo
+            [ -n "$PREV" ] && echo "[Full diff](${URL}/compare/${PREV}...${NEW})" && echo
+            echo "### Changelog"
+            echo
+            git log $RANGE --no-merges \
+              --pretty=format:"- %s ([\`%h\`](${URL}/commit/%H)) — %an"
+            echo
+            echo
+            echo "<!-- upstream-commit:${NEW} -->"
+          } > ../notes.md
+          cat ../notes.md
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.build == 'true'
+        with:
+          python-version: "3.x"
+
+      - name: Generate translation contributor credits
+        if: steps.gate.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          [ -f scripts/generate_translation_contributors.py ] && python scripts/generate_translation_contributors.py || echo "script not found, skipping"
+
+      - uses: actions/setup-java@v4
+        if: steps.gate.outputs.build == 'true'
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: android-actions/setup-android@v3
+        if: steps.gate.outputs.build == 'true'
+
+      - name: Install build-tools
+        if: steps.gate.outputs.build == 'true'
+        run: sdkmanager "build-tools;${BUILD_TOOLS}"
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.gate.outputs.build == 'true'
+
+      - name: Build
+        if: steps.gate.outputs.build == 'true'
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew $GRADLE_TASKS --stacktrace
+        env:
+          PULL_REQUEST: "false"
+          NIGHTLY_BUILD_HASH: ${{ steps.up.outputs.short }}
+
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          TOGETHER_BEARER_TOKEN: ${{ secrets.TOGETHER_BEARER_TOKEN }}
+          CANVAS_BEARER_TOKEN: ${{ secrets.CANVAS_BEARER_TOKEN }}
+          EXTRACTOR_BEARER: ${{ secrets.EXTRACTOR_BEARER }}
+
+      - name: Sign APKs
+        if: steps.gate.outputs.build == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || { echo "::error::Missing secret $v"; exit 1; }
+          done
+          echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+
+          BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
+          mkdir -p out
+          mapfile -t APKS < <(find upstream/app/build/outputs/apk -name '*.apk' -iname '*release*')
+          [ ${#APKS[@]} -gt 0 ] || { echo "::error::No release APKs found"; exit 1; }
+
+          for apk in "${APKS[@]}"; do
+            base=$(basename "$apk" .apk | sed 's/-unsigned//')
+            "$BT/zipalign" -p -f 4 "$apk" "aligned.apk"
+            "$BT/apksigner" sign --ks release.jks \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KEYSTORE_PASSWORD \
+              --key-pass env:KEY_PASSWORD \
+              --out "out/ArchiveTune-nightly-${{ steps.up.outputs.short }}-${base}.apk" aligned.apk
+            rm aligned.apk
+          done
+          rm -f release.jks
+          ls -lh out
+
+      - name: Publish release
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          TAG="nightly-$(date -u +%Y%m%d)-${{ steps.up.outputs.short }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping."
+            exit 0
+          fi
+          gh release create "$TAG" out/*.apk \
+            --title "Nightly $(date -u +%Y-%m-%d) (${{ steps.up.outputs.short }})" \
+            --notes-file notes.md \
+            --prerelease
