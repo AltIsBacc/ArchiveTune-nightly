@@ -26,6 +26,7 @@ env:
   JAVA_VERSION: "27"
   BUILD_TOOLS: "35.0.0"
   GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   nightly:
